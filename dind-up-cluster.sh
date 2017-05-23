@@ -42,6 +42,7 @@ function dind::docker_compose {
     "SERVICE_CIDR"
     "DNS_SERVER_IP"
     "DNS_DOMAIN"
+    "DOCKER_NETWORK_OFFSET"
   )
 
   (
@@ -51,7 +52,7 @@ function dind::docker_compose {
 
     export DOCKER_IN_DOCKER_STORAGE_DIR=${DOCKER_IN_DOCKER_STORAGE_DIR:-${DOCKER_IN_DOCKER_WORK_DIR}/storage}
 
-    docker-compose -p dind -f "${DIND_ROOT}/docker-compose.yml" ${params}
+    docker-compose -p ${CLUSTER_NAME} -f "${DIND_ROOT}/docker-compose.yml" ${params}
   )
 }
 
@@ -80,18 +81,20 @@ function dind::create-kubeconfig {
   local kubectl="cluster/kubectl.sh"
 
   local token="$(cut -d, -f1 ${auth_dir}/token-users)"
-  "${kubectl}" config set-cluster "dind" --server="${KUBE_SERVER}" --certificate-authority="${auth_dir}/ca.pem"
-  "${kubectl}" config set-context "dind" --cluster="dind" --user="cluster-admin"
-  "${kubectl}" config set-credentials cluster-admin --token="${token}"
-  "${kubectl}" config use-context "dind" --cluster="dind"
+  "${kubectl}" config set-cluster "${CLUSTER_NAME}" --server="${KUBE_SERVER}" --certificate-authority="${auth_dir}/ca.pem"
+  "${kubectl}" config set-context "${CLUSTER_NAME}" --cluster="${CLUSTER_NAME}" --user="${CLUSTER_NAME}-cluster-admin"
+  "${kubectl}" config set-credentials ${CLUSTER_NAME}-cluster-admin --token="${token}"
+  "${kubectl}" config use-context "${CLUSTER_NAME}" --cluster="${CLUSTER_NAME}"
 
-   echo "Wrote config for dind context" 1>&2
+   echo "Wrote config for ${CLUSTER_NAME} context" 1>&2
 }
 
 # Must ensure that the following ENV vars are set
 function dind::detect-master {
-  KUBE_MASTER_IP="${APISERVER_ADDRESS}:6443"
-  KUBE_SERVER="https://${KUBE_MASTER_IP}"
+  #KUBE_MASTER_IP="${APISERVER_ADDRESS}:6443"
+  KUBE_MASTER_IP="${APISERVER_ADDRESS}:8888"
+  #KUBE_SERVER="https://${KUBE_MASTER_IP}"
+  KUBE_SERVER="http://${KUBE_MASTER_IP}"
 
   echo "KUBE_MASTER_IP: $KUBE_MASTER_IP" 1>&2
 }
@@ -145,12 +148,22 @@ function dind::init_auth {
     cd /certs
     echo '{"CN":"CA","key":{"algo":"rsa","size":2048}}' | cfssl gencert -initca - | cfssljson -bare ca -
     echo '{"signing":{"default":{"expiry":"43800h","usages":["signing","key encipherment","server auth","client auth"]}}}' > ca-config.json
-    echo '{"CN":"'apiserver'","hosts":[""],"key":{"algo":"rsa","size":2048}}' | \
-      cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -hostname=apiserver,kubernetes,kubernetes.default.svc.${DNS_DOMAIN},${APISERVER_SERVICE_IP},${APISERVER_ADDRESS} - | \
+    echo '{"CN":"'apiserver'","hosts":[""],"key":{"algo":"rsa","size":2048},"names":[{"CN":"kube-admin", "O":"system:masters"}]}' | \
+      cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -hostname=apiserver,kubernetes,kubernetes.default.svc.${DNS_DOMAIN},${APISERVER_SERVICE_IP},${APISERVER_ADDRESS},${CLUSTER_NAME} - | \
       cfssljson -bare apiserver
 EOF
   )"
   cat "${auth_dir}/apiserver.pem" "${auth_dir}/ca.pem" > "${auth_dir}/apiserver-bundle.pem"
+}
+
+# Create default docker network for the cluster
+function dind::create_default_network {
+  docker network create --driver=bridge --subnet=${IP_RANGE} ${CLUSTER_NAME}_default
+}
+
+# Delete default docker network for the cluster
+function dind::delete_default_network {
+  docker network rm ${CLUSTER_NAME}_default
 }
 
 # Instantiate a kubernetes cluster.
@@ -166,10 +179,11 @@ function dind::kube-up {
 
   dind::init_auth
 
+  dind::step "Creating network for the cluster: ${CLUSTER_NAME}_default"
+  dind::create_default_network
+
   dind::step "Starting dind cluster"
-  dind::docker_compose up -d --force-recreate
-  dind::step "Scaling dind cluster to ${NUM_NODES} slaves"
-  dind::docker_compose scale node=${NUM_NODES}
+  dind::docker_compose up -d --force-recreate --scale node=${NUM_NODES}
 
   dind::step -n "Waiting for https://${APISERVER_ADDRESS}:6443 to be healthy"
   while ! curl -o /dev/null -s --cacert ${DOCKER_IN_DOCKER_WORK_DIR}/auth/ca.pem https://${APISERVER_ADDRESS}:6443; do
@@ -190,8 +204,12 @@ function dind::kube-up {
   fi
 
   # Wait for addons to deploy
-  dind::await_ready "kube-dns" "${DOCKER_IN_DOCKER_ADDON_TIMEOUT}"
-  dind::await_ready "kubernetes-dashboard" "${DOCKER_IN_DOCKER_ADDON_TIMEOUT}"
+  dind::await_ready "k8s-app=kube-dns" "${DOCKER_IN_DOCKER_ADDON_TIMEOUT}"
+  dind::await_ready "k8s-app=kubernetes-dashboard" "${DOCKER_IN_DOCKER_ADDON_TIMEOUT}"
+  
+  if [ "${ENABLE_FEDERATION}" == "true" ]; then
+    dind::deploy_federation
+  fi
 }
 
 function dind::deploy-dns {
@@ -214,6 +232,37 @@ function dind::deploy-ui {
   "cluster/kubectl.sh" create -f "cluster/addons/dashboard/dashboard-service.yaml"
 }
 
+function dind::deploy_federation {
+  # init helm
+  helm init
+  dind::await_ready "app=helm" "${DOCKER_IN_DOCKER_ADDON_TIMEOUT}"
+
+  # install etcd
+  helm install stable/etcd-operator --name etcd-operator --wait --timeout 300 
+  dind::await_ready "app=etcd-operator-etcd-opera" "2000" "default"
+  dind::await_tpr "cluster.etcd.coreos.com" "${DOCKER_IN_DOCKER_ADDON_TIMEOUT}"
+  helm upgrade etcd-operator stable/etcd-operator --wait --timeout 300 --set cluster.enabled=true
+  
+  # install coredns
+  helm install --name coredns --wait --timeout 600 -f values.yaml stable/coredns
+
+  # install private docker registry
+  kubectl create -f registry.yml
+  # Wait for addons to deploy
+  dind::await_ready "k8s-app=kube-registry" "${DOCKER_IN_DOCKER_ADDON_TIMEOUT}"
+  kubectl create -f registry-svc.yml
+  kubectl create -f registry-ds.yaml
+  # Wait for addons to deploy
+  dind::await_ready "k8s-app=registry-proxy" "${DOCKER_IN_DOCKER_ADDON_TIMEOUT}"
+  
+  # local proxy to push images
+  POD=$(kubectl get pods --namespace kube-system -l k8s-app=kube-registry \
+	  -o template --template '{{range .items}}{{.metadata.name}} {{.status.phase}}{{"\n"}}{{end}}' \
+	  | grep Running | head -1 | cut -f1 -d' ')
+  kubectl port-forward --namespace kube-system $POD 5000:5000 &
+  # run kubefed
+}
+
 function dind::validate-cluster {
   dind::step "Validating dind cluster"
 
@@ -230,34 +279,56 @@ function dind::kube-down {
   dind::step "Stopping dind cluster"
   # Since restoring a stopped cluster is not yet supported, use the nuclear option
   dind::docker_compose kill
-  dind::docker_compose rm -f --all
+  dind::docker_compose rm -f
+  dind::step "Removing cluster network ${CLUSTER_NAME}_default"
+  dind::delete_default_network
 }
 
 # Waits for a kube-system pod (of the provided name) to have the phase/status "Running".
 function dind::await_ready {
   local pod_name="$1"
   local max_attempts="$2"
+  local namespace=${3:-kube-system}
   local phase="Unknown"
   echo -n "${pod_name}: "
   local n=0
   until [ ${n} -ge ${max_attempts} ]; do
-    phase=$(dind::addon_status "${pod_name}")
-    if [ "${phase}" == "Running" ]; then
+    ready=$(dind::is_pod_ready "${pod_name}" "${namespace}")
+    if [ "${ready}" == "True" ]; then
       break
     fi
     echo -n "."
     n=$[$n+1]
     sleep 1
   done
-  echo "${phase}"
-  return $([ "${phase}" == "Running" ]; echo $?)
+  echo "${ready}"
+  return $([ "${ready}" == "True" ]; echo $?)
+}
+
+function dind::await_tpr {
+  local tpr="$1"
+  local max_attempts="$2"
+  local ready="False"
+  echo -n "${tpr}: "
+  local n=0
+  until [ ${n} -ge ${max_attempts} ]; do
+    if [ ! $(cluster/kubectl.sh get thirdpartyresources 2>/dev/null|grep "${tpr}" &>/dev/null) ]; then
+      ready="True"
+      break
+    fi
+    echo -n "."
+    n=$[$n+1]
+    sleep 1
+  done
+  return $([ "${ready}" == "True" ]; echo $?)
 }
 
 # Prints the status of the kube-system pod specified
-function dind::addon_status {
-  local pod_name="$1"
+function dind::is_pod_ready {
+  local label="$1"
+  local namespace="$2"
   local kubectl="cluster/kubectl.sh"
-  local phase=$("${kubectl}" get pods --namespace=kube-system -l k8s-app=${pod_name} -o template --template="{{(index .items 0).status.phase}}" 2>/dev/null)
+  local phase=$("${kubectl}" get pods --namespace=${namespace} -l ${label} -o jsonpath --template="{.items[0]['status']['conditions'][?(@.type==\"Ready\")].status}" 2>/dev/null)
   phase="${phase:-Unknown}"
   echo "${phase}"
 }
@@ -291,4 +362,7 @@ if [ $(basename "$0") = dind-up-cluster.sh ]; then
 elif [ $(basename "$0") = dind-down-cluster.sh ]; then
   source "${DIND_ROOT}/config.sh"
   dind::kube-down
+elif [ $(basename "$0") = dind-deploy-federation.sh ]; then
+  source "${DIND_ROOT}/config.sh"
+  dind::deploy_federation
 fi
